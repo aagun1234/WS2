@@ -209,7 +209,7 @@ func (s *Server) readWebSocketMessages(wsConn *WebSocketConn) {
 			}
 			
 			if s.cfg.LogDebug {
-				log.Printf("[Server] WebSocket %d DumpMessage \nMessageType: %d\nSessionID: %d\nPayloadLength: %d\nPayload: %v",wsConn.ID, msg.Type, msg.SessionID, len(msg.Payload), msg.Payload)
+				log.Printf("[Server] WebSocket %d  MessageType: %d, SessionID: %d, SquenceID: %d, PayloadLength: %d",wsConn.ID, msg.Type, msg.SessionID, msg.SequenceID, len(msg.Payload))
 		    }
 
 			switch msg.Type {
@@ -217,21 +217,56 @@ func (s *Server) readWebSocketMessages(wsConn *WebSocketConn) {
 				// Server now connects directly to the target address provided by the client.
 				// This makes the server truly general-purpose for proxying.
 				targetAddr := string(msg.Payload)
-				log.Printf("[Server] WS %d: Open session %d to client-requested target: %s", wsConn.ID, msg.SessionID, targetAddr)
-				s.handleOpenSession(wsConn, msg.SessionID, targetAddr) // Use client-provided targetAddr
+				log.Printf("[Server] WS %d: Opening session %d to client-requested target: %s", wsConn.ID, msg.SessionID, targetAddr)
 				
-			case protocol.MsgTypeData:
-				if sess, ok := s.sessionManager.LoadSession(msg.SessionID); ok {
-					if _, err := sess.targetConn.Write(msg.Payload); err != nil {
-						log.Printf("[Server] WS %d: Error writing data to target for session %d: %v", wsConn.ID, msg.SessionID, err)
+				if s.handleOpenSession(wsConn, msg.SessionID, msg.SequenceID+1, targetAddr) { // Use client-provided targetAddr
+					//打开到目标的连接后，发送会话应答，消息与OPEN_SESSION相同（方向不同），后继会话的序列号从此开始递增
+					//如果应答发送失败，结束这个会话
+					log.Printf("[Server] WS %d: Target %s session %d Opened", wsConn.ID, targetAddr, msg.SessionID)
+					time.Sleep(100 * time.Millisecond)
+					if err := wsConn.WriteMessage(protocol.NewOpenSessionMessage(msg.SessionID, msg.SequenceID, targetAddr)); err != nil {
+						log.Printf("[Server] WS %d: Reply OPEN_SESSION Message Failed, SessionID:%d, SequenceID:%d", wsConn.ID, msg.SessionID, msg.SequenceID)
+						if sess, ok := s.sessionManager.LoadSession(msg.SessionID); ok {
+							sess.Close()
+						}
+					}
+				} else {
+					log.Printf("[Server] WS %d: Open session Failed, sending CLOSE_SESSION", wsConn.ID)
+					time.Sleep(100 * time.Millisecond)
+					if err := wsConn.WriteMessage(protocol.NewCloseSessionMessage(msg.SessionID)); err != nil {
+						log.Printf("[Server] WS %d: Open session %d Failed", wsConn.ID)
+					}
+					if sess, ok := s.sessionManager.LoadSession(msg.SessionID); !ok {
+						log.Printf("[Server] WS %d: Session %d Store failed", wsConn.ID, msg.SessionID)
 						sess.Close()
 					}
+				}
+				
+			case protocol.MsgTypeData:
+				log.Printf("[Server] WS %d: MsgTypeData", wsConn.ID)
+				if sess, ok := s.sessionManager.LoadSession(msg.SessionID); ok {
+					
+					sess.rxmu.Lock()
+					sess.receiveBuffer[msg.SequenceID] = msg
+					sess.bufferCond.Signal() // 通知等待中的消费者有新消息到达
+					sess.rxmu.Unlock()
+					//val,ok:=sess.lastPing[wsConn]
+					//if ok {
+					//	val.Store(time.Now().UnixNano())//保存上数据活动的时间
+					//}
+					
+					//这里不直接转发，等待会话协程处理缓冲区
+					// if _, err := sess.targetConn.Write(msg.Payload); err != nil {
+						// log.Printf("[Server] WS %d: Error writing data to target for session %d: %v", wsConn.ID, msg.SessionID, err)
+						// sess.Close()
+					// }
 				} else {
 					if s.cfg.LogDebug {
 						log.Printf("[Server] WS %d: Received data for unknown session %d", wsConn.ID, msg.SessionID)
 					}
 					wsConn.WriteMessage(protocol.NewCloseSessionMessage(msg.SessionID))
 				}
+
 			case protocol.MsgTypeCloseSession:
 				if sess, ok := s.sessionManager.LoadSession(msg.SessionID); ok {
 					if s.cfg.LogDebug {
@@ -258,7 +293,7 @@ func (s *Server) readWebSocketMessages(wsConn *WebSocketConn) {
 }
 
 // handleOpenSession establishes a connection to the target host.
-func (s *Server) handleOpenSession(wsConn *WebSocketConn, sessionID uint64, targetAddr string) {
+func (s *Server) handleOpenSession(wsConn *WebSocketConn, sessionID, startSeqID uint64, targetAddr string) bool {
 	// Server now dials directly to the targetAddr provided by the client.
 	if s.cfg.LogDebug {
 		log.Printf("[Server] WS %d: handleOpenSession start ", wsConn.ID)
@@ -267,19 +302,24 @@ func (s *Server) handleOpenSession(wsConn *WebSocketConn, sessionID uint64, targ
 	if err != nil {
 		log.Printf("[Server] [handleOpenSession] WS %d: Failed to connect to client-requested target %s for session %d: %v", wsConn.ID, targetAddr, sessionID, err)
 		wsConn.WriteMessage(protocol.NewCloseSessionMessage(sessionID))
-		return
+		return false
 	}
 
 	if s.cfg.LogDebug {
 		log.Printf("[Server] [handleOpenSession] WS %d: Successfully connected to client-requested target %s for session %d.", wsConn.ID, targetAddr, sessionID)
 	}
 	sess := NewTargetSession(sessionID, wsConn, s.sessionManager, targetConn)
+	sess.nextSequenceID=startSeqID
+	sess.sendSequenceID=startSeqID
 	s.sessionManager.StoreSession(sessionID, sess)
 	
 	if s.cfg.LogDebug {
 		log.Printf("[Server] WS %d: Target handling goroutine for session %d Started.", wsConn.ID, sessionID)
 	}
+	go sess.StartMessage()
 	go sess.Start()
+	
+	return true
 	
 }
 

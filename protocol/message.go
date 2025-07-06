@@ -21,8 +21,8 @@ const (
 
 const (
 	// HeaderSize is the fixed size of our custom message header:
-	// 1 byte (MsgType) + 8 bytes (SessionID)
-	HeaderSize = 1 + 8
+	// 1 byte (MsgType) + 8 bytes (SessionID) + 8 bytes (sequence) 
+	HeaderSize = 1 + 8 + 8
 	// MaxPayloadSize is an arbitrary limit for a single message payload.
 	// Large data streams will be split into multiple MsgTypeData messages.
 	MaxPayloadSize = 65535 // ~64KB
@@ -32,6 +32,7 @@ const (
 type TunnelMessage struct {
 	Type      MessageType
 	SessionID uint64
+	SequenceID uint64
 	Payload   []byte // Can be target address, actual data, or ping timestamp
 }
 
@@ -40,7 +41,7 @@ func (tm *TunnelMessage) Marshal() ([]byte, error) {
 	header := make([]byte, HeaderSize)
 	header[0] = byte(tm.Type)
 	binary.BigEndian.PutUint64(header[1:9], tm.SessionID)
-
+	binary.BigEndian.PutUint64(header[9:17], tm.SequenceID)
 	return append(header, tm.Payload...), nil
 }
 
@@ -52,24 +53,27 @@ func (tm *TunnelMessage) Unmarshal(data []byte) error {
 
 	tm.Type = MessageType(data[0])
 	tm.SessionID = binary.BigEndian.Uint64(data[1:9])
+	tm.SequenceID = binary.BigEndian.Uint64(data[9:17])
 	tm.Payload = data[HeaderSize:]
 	return nil
 }
 
 // NewOpenSessionMessage creates an OPEN_SESSION message.
-func NewOpenSessionMessage(sessionID uint64, targetAddr string) *TunnelMessage {
+func NewOpenSessionMessage(sessionID, seqID uint64, targetAddr string) *TunnelMessage {
 	return &TunnelMessage{
 		Type:      MsgTypeOpenSession,
 		SessionID: sessionID,
+		SequenceID: seqID,
 		Payload:   []byte(targetAddr),
 	}
 }
 
 // NewDataMessage creates a DATA message.
-func NewDataMessage(sessionID uint64, data []byte) *TunnelMessage {
+func NewDataMessage(sessionID , seqID uint64, data []byte) *TunnelMessage {
 	return &TunnelMessage{
 		Type:      MsgTypeData,
 		SessionID: sessionID,
+		SequenceID: seqID,
 		Payload:   data,
 	}
 }
@@ -79,6 +83,7 @@ func NewCloseSessionMessage(sessionID uint64) *TunnelMessage {
 	return &TunnelMessage{
 		Type:      MsgTypeCloseSession,
 		SessionID: sessionID,
+		SequenceID: 0,
 	}
 }
 
@@ -94,6 +99,7 @@ func NewPingMessage(timestamp int64) *TunnelMessage {
 	return &TunnelMessage{
 		Type:      MsgTypePing,
 		SessionID: 0, // Ping messages don't need a session ID
+		SequenceID: 0,
 		Payload:   payload,
 	}
 }
@@ -110,6 +116,7 @@ func NewPongMessage(timestamp int64) *TunnelMessage {
 	return &TunnelMessage{
 		Type:      MsgTypePong,
 		SessionID: 0, // Pong messages don't need a session ID
+		SequenceID: 0,
 		Payload:   payload,
 	}
 }

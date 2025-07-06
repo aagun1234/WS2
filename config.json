@@ -6,7 +6,7 @@
   "forward_target": "127.0.0.1:7892",
   "secret_key": "abcdefghijklmnopqrstuvwxyz123456",
   "auth_token": "mysecretproxytoken",
-  "tunnel_count": 8,
+  "tunnel_count": 1,
   "ping_interval": 30,
   "log_debug": true,
   "insecure_skip_verify": true

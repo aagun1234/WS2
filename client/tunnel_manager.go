@@ -40,6 +40,8 @@ type Tunnel struct {
 	reconnectAttempts atomic.Int32 // Consecutive failed connection attempts
 	nextReconnectTime atomic.Int64 // UnixNano of when the next reconnect attempt is allowed
 	cancel            context.CancelFunc // Context cancel for goroutines associated with this tunnel
+	OpenACKs 	      map[uint64]chan protocol.TunnelMessage
+	OpenACKMutex      sync.Mutex      // 待处理请求锁
 }
 
 // Latency returns the current average latency of the tunnel in milliseconds.
@@ -59,6 +61,33 @@ func (t *Tunnel) IsConnected() bool {
 	// Also check for recent heartbeat to ensure liveness
 	return time.Now().UnixNano()-t.lastHeartbeat.Load() < int64(t.config.PingInterval*3)*int64(time.Second)
 }
+
+
+func (t *Tunnel) WriteAndWait(msg *protocol.TunnelMessage, sessionID, sequenceID uint64, timeout int) (*protocol.TunnelMessage, error) {
+
+	ch := make(chan protocol.TunnelMessage, 1)
+	t.OpenACKMutex.Lock()
+	t.OpenACKs[sessionID<<32|sequenceID] = ch
+	t.OpenACKMutex.Unlock()
+	
+	defer func() {
+		t.OpenACKMutex.Lock()
+		delete(t.OpenACKs, sessionID<<32|sequenceID)
+		t.OpenACKMutex.Unlock()
+	}()
+	
+	if err := t.WriteMessage(msg); err != nil {
+		return nil, err
+	}
+		
+	select {
+	case resp := <-ch:
+		return &resp, nil
+	case  <-time.After(time.Duration(timeout) * time.Second):
+		return nil, fmt.Errorf("Wait for Reply Timeout")
+	}
+}
+
 
 // WriteMessage encrypts and sends a TunnelMessage over the WebSocket.
 func (t *Tunnel) WriteMessage(msg *protocol.TunnelMessage) error {
@@ -167,6 +196,7 @@ func NewTunnelManager(cfg *config.Config, sessions *sync.Map) *TunnelManager {
 			closeChan: make(chan struct{}),
 			config:    cfg,
 			cancel:    tunnelCancel,
+			OpenACKs:  make(map[uint64]chan protocol.TunnelMessage),
 		}
 		t.latency.Store(math.MaxInt64) // Initialize with max latency
 		t.lastHeartbeat.Store(0)
@@ -361,16 +391,30 @@ func (tm *TunnelManager) handleTunnelRead(ctx context.Context, t *Tunnel) {
 			t.lastHeartbeat.Store(time.Now().UnixNano()) // Update heartbeat on any received message
 
 			switch msg.Type {
+			case protocol.MsgTypeOpenSession:
+				t.OpenACKMutex.Lock()
+				if ch, ok := t.OpenACKs[msg.SessionID<<32|msg.SequenceID]; ok {
+					ch <- *msg
+					delete(t.OpenACKs, msg.SessionID<<32|msg.SequenceID)
+				}
+				t.OpenACKMutex.Unlock()
+				
 			case protocol.MsgTypeData:
 				if val, ok := tm.sessions.Load(msg.SessionID); ok {
 					sess := val.(*Session)
 					if tm.cfg.LogDebug {
 						log.Printf("[TunnelRead] [Tunnel %d] Received %d bytes data for session %d, ssending to %s.", t.ID, len(msg.Payload), msg.SessionID, sess.clientConn.RemoteAddr())
 					}
-					if _, err := sess.clientConn.Write(msg.Payload); err != nil {
-						log.Printf("[TunnelRead] [Tunnel %d] Error writing data to client connection %d: %v", t.ID, msg.SessionID, err)
-						sess.Close() // Close session if client write fails
-					}
+					// 将消息放入会话的接收缓冲区
+					sess.rxmu.Lock()
+					sess.receiveBuffer[msg.SequenceID] = msg
+					sess.bufferCond.Signal() // 通知等待中的消费者有新消息到达
+					sess.rxmu.Unlock()
+					//这里不直接转发，等待会话协程处理缓冲区
+					// if _, err := sess.clientConn.Write(msg.Payload); err != nil {
+						// log.Printf("[TunnelRead] [Tunnel %d] Error writing data to client connection %d: %v", t.ID, msg.SessionID, err)
+						// sess.Close() // Close session if client write fails
+					// }
 				} else {
 					log.Printf("[TunnelRead] [Tunnel %d] Received data for unknown session %d, Closing session.", t.ID, msg.SessionID)
 					// Potentially send a close message back to server if session unknown

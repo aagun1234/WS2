@@ -13,23 +13,100 @@ import (
 // TargetSession represents an outbound connection to a target host on the server side.
 type TargetSession struct {
 	SessionID uint64
+	nextSequenceID uint64
+	sendSequenceID uint64
 	wsConn    *WebSocketConn // Reference back to the specific WebSocket connection
 	targetConn net.Conn      // The actual connection to the target
 	manager   *SessionManager // Reference back to the manager
 	closed    chan struct{}
 	once      sync.Once
+	
+	rxmu             sync.RWMutex
+	receiveBuffer  map[uint64]*protocol.TunnelMessage // 存储乱序到达的消息
+	bufferCond     *sync.Cond                // 用于通知等待新消息的消费者
+	
 }
 
 // NewTargetSession creates a new TargetSession.
 func NewTargetSession(sessionID uint64, wsConn *WebSocketConn, manager *SessionManager, targetConn net.Conn) *TargetSession {
-	return &TargetSession{
-		SessionID:  sessionID,
-		wsConn:    wsConn,
-		targetConn: targetConn,
-		manager:   manager,
-		closed:    make(chan struct{}),
-	}
+	var tsess *TargetSession
+
+		tsess = &TargetSession{
+			SessionID:  sessionID,
+			sendSequenceID: 0,
+			nextSequenceID: 0,
+			//wsConns:    wsConns,
+			wsConn:    wsConn,
+			targetConn: targetConn,
+			manager:   manager,
+			closed:    make(chan struct{}),
+			receiveBuffer: make(map[uint64]*protocol.TunnelMessage),
+		}
+		tsess.bufferCond = sync.NewCond(&tsess.rxmu) // 使用 session 的 RWMutex 作为 Cond 的 Locker
+	return tsess
 }
+
+
+
+
+// StartMessageProcessing 启动一个 goroutine 来处理会话接收到的消息 remote->local
+func (ts *TargetSession) StartMessage() { 
+	go func() {
+		for {
+			log.Printf("[Server] [Message Buffer Processing], waiting for %d, Bufferlen: %d", ts.nextSequenceID,len(ts.receiveBuffer))
+			ts.rxmu.Lock()
+			for { //循环等待直到有nextSequenceID
+				msg, exists := ts.receiveBuffer[ts.nextSequenceID]
+				if exists {
+					log.Printf("[Server] [Message Buffer Processing] Message with seqID:%d, SessionID: %d, PayloadLen:%d",ts.nextSequenceID, msg.SessionID, len(msg.Payload))
+					if msg.SessionID==ts.SessionID && msg.SequenceID==ts.nextSequenceID {
+						// 找到了期待的消息，可以处理了
+						
+						delete(ts.receiveBuffer, ts.nextSequenceID) // 从缓冲区中移除
+						log.Printf("[Server] [Message Buffer Processing] Message delete from buffer, bufferlen: %d",len(ts.receiveBuffer))
+						ts.nextSequenceID++                       // 更新期待的下一条序列号
+						ts.rxmu.Unlock()
+
+						// 处理并转发消息
+						if _, err := ts.targetConn.Write(msg.Payload); err != nil {
+							log.Printf("[Server] [Message Buffer Processing] WS Error writing data to target for session %d: %v",  msg.SessionID, err)
+							ts.Close() // Close session if client write fails
+							return    // 退出处理循环
+						} else {
+							log.Printf("[Server] [Message Buffer Processing] session %d: Message sent to %s",  msg.SessionID, ts.targetConn.RemoteAddr())
+						}
+						
+						break // 跳出内层循环，继续处理下一条消息
+					} else {
+						
+						delete(ts.receiveBuffer, ts.nextSequenceID) // 从缓冲区中移除
+						log.Printf("[Server] [Message Buffer Processing] WS Message %d SessionID MisMatch Error, %d != %d, just remove from Buffer, bufferlen:%d",  msg.SequenceID, msg.SessionID, ts.SessionID, len(ts.receiveBuffer))
+					}
+					
+				} else {
+					// 如果缓冲区中没有期待的消息，则等待
+					ts.bufferCond.Wait() // 释放锁并等待 Signal
+					// Signal 收到后，Wait 会重新获取锁并返回，然后再次检查条件
+				}
+			}
+
+			// 检查会话是否已关闭
+			select {
+			case <-ts.closed:
+
+				return // 会话关闭，退出 goroutine
+			default:
+				// 继续处理
+			}
+		}
+	}()
+	// Keep this goroutine alive until session is closed (waits on ts.closed)
+	<-ts.closed
+}
+
+
+
+
 
 // Start initiates the data forwarding for the target session.
 func (ts *TargetSession) Start() {
@@ -58,13 +135,21 @@ func (ts *TargetSession) Start() {
 				}
 
 				if n > 0 {
-					//log.Printf("[Server Session %d] Received %d bytes of data from target connection %s, sending to %s", ts.SessionID,n, ts.targetConn.RemoteAddr(),ts.wsConn.conn.UnderlyingConn().RemoteAddr())
-					if err := ts.wsConn.WriteMessage(protocol.NewDataMessage(ts.SessionID, buf[:n])); err != nil {
-						log.Printf("[Server Session %d] Error sending data over WebSocket: %v", ts.SessionID, err)
-						ts.Close()
-						return
+					log.Printf("[Server Session %d] Received %d bytes of data from target connection %s, %v , %v", ts.SessionID, n, ts.targetConn.RemoteAddr(),buf[:n], (ts.wsConn==nil))
+					msg:=protocol.NewDataMessage(ts.SessionID, ts.sendSequenceID, buf[:n])
+					if ts.wsConn.IsConnected() {
+						if err := ts.wsConn.WriteMessage(msg); err != nil {
+							log.Printf("[Server Session %d] Error sending data (Seq:%d) over WebSocket: %v", ts.SessionID, ts.sendSequenceID, err)
+							ts.Close()
+							return
+						}
+					} else {
+						log.Printf("[Server Session %d] WebSocket NOT CONNECTED", ts.SessionID, ts.sendSequenceID)
 					}
-					//log.Printf("[Server Session %d] Data Sent (%d bytes)", ts.SessionID,n)
+					
+					log.Printf("[Server Session %d] %d bytes Data Sent (SeqID：%d)", ts.SessionID, n, ts.sendSequenceID)
+					ts.sendSequenceID++
+					
 				}
 			}
 		}
